@@ -44,6 +44,9 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_srvs/srv/empty.hpp>
+#include <tf2_ros/static_transform_broadcaster.hpp>
+#include <tf2_ros/transform_broadcaster.hpp>
 
 namespace {
 Sophus::SE3d LookupTransform(const std::string &target_frame,
@@ -73,33 +76,8 @@ using utils::PointCloud2ToEigen;
 
 OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
     : rclcpp::Node("kiss_icp_node", options) {
-    base_frame_ = declare_parameter<std::string>("base_frame", base_frame_);
-    odom_frame_ = declare_parameter<std::string>("odom_frame", odom_frame_);
-    publish_odom_tf_ = declare_parameter<bool>("publish_odom_tf", publish_odom_tf_);
-    publish_debug_clouds_ = declare_parameter<bool>("publish_debug_clouds", publish_debug_clouds_);
-    position_covariance_ = declare_parameter<double>("position_covariance", 0.1);
-    orientation_covariance_ = declare_parameter<double>("orientation_covariance", 0.1);
-
     kiss_icp::pipeline::KISSConfig config;
-    config.max_range = declare_parameter<double>("max_range", config.max_range);
-    config.min_range = declare_parameter<double>("min_range", config.min_range);
-    config.deskew = declare_parameter<bool>("deskew", config.deskew);
-    config.voxel_size = declare_parameter<double>("voxel_size", config.max_range / 100.0);
-    config.max_points_per_voxel =
-        declare_parameter<int>("max_points_per_voxel", config.max_points_per_voxel);
-    config.initial_threshold =
-        declare_parameter<double>("initial_threshold", config.initial_threshold);
-    config.min_motion_th = declare_parameter<double>("min_motion_th", config.min_motion_th);
-    config.max_num_iterations =
-        declare_parameter<int>("max_num_iterations", config.max_num_iterations);
-    config.convergence_criterion =
-        declare_parameter<double>("convergence_criterion", config.convergence_criterion);
-    config.max_num_threads = declare_parameter<int>("max_num_threads", config.max_num_threads);
-    if (config.max_range < config.min_range) {
-        RCLCPP_WARN(get_logger(),
-                    "[WARNING] max_range is smaller than min_range, settng min_range to 0.0");
-        config.min_range = 0.0;
-    }
+    initializeParameters(config);
 
     // Construct the main KISS-ICP odometry node
     kiss_icp_ = std::make_unique<kiss_icp::pipeline::KissICP>(config);
@@ -111,12 +89,11 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
 
     // Initialize publishers
     rclcpp::QoS qos((rclcpp::SystemDefaultsQoS().keep_last(1).durability_volatile()));
-    odom_publisher_ = create_publisher<nav_msgs::msg::Odometry>("/kiss/odometry", qos);
+    odom_publisher_ = create_publisher<nav_msgs::msg::Odometry>("kiss/odometry", qos);
     if (publish_debug_clouds_) {
-        frame_publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>("/kiss/frame", qos);
-        kpoints_publisher_ =
-            create_publisher<sensor_msgs::msg::PointCloud2>("/kiss/keypoints", qos);
-        map_publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>("/kiss/local_map", qos);
+        frame_publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>("kiss/frame", qos);
+        kpoints_publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>("kiss/keypoints", qos);
+        map_publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>("kiss/local_map", qos);
     }
 
     // Initialize the transform broadcaster
@@ -124,8 +101,59 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
     tf2_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
     tf2_buffer_->setUsingDedicatedThread(true);
     tf2_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf2_buffer_);
+    // Initialize service servers
+    reset_service_ = create_service<std_srvs::srv::Empty>(
+        "kiss/reset", std::bind(&OdometryServer::ResetService, this, std::placeholders::_1,
+                                std::placeholders::_2));
 
     RCLCPP_INFO(this->get_logger(), "KISS-ICP ROS 2 odometry node initialized");
+}
+
+void OdometryServer::initializeParameters(kiss_icp::pipeline::KISSConfig &config) {
+    RCLCPP_INFO(this->get_logger(), "Initializing parameters");
+
+    base_frame_ = declare_parameter<std::string>("base_frame", base_frame_);
+    RCLCPP_INFO(this->get_logger(), "\tBase frame: %s", base_frame_.c_str());
+    lidar_odom_frame_ = declare_parameter<std::string>("lidar_odom_frame", lidar_odom_frame_);
+    RCLCPP_INFO(this->get_logger(), "\tLiDAR odometry frame: %s", lidar_odom_frame_.c_str());
+    publish_odom_tf_ = declare_parameter<bool>("publish_odom_tf", publish_odom_tf_);
+    RCLCPP_INFO(this->get_logger(), "\tPublish odometry transform: %d", publish_odom_tf_);
+    invert_odom_tf_ = declare_parameter<bool>("invert_odom_tf", invert_odom_tf_);
+    RCLCPP_INFO(this->get_logger(), "\tInvert odometry transform: %d", invert_odom_tf_);
+    publish_debug_clouds_ = declare_parameter<bool>("publish_debug_clouds", publish_debug_clouds_);
+    RCLCPP_INFO(this->get_logger(), "\tPublish debug clouds: %d", publish_debug_clouds_);
+
+    config.max_range = declare_parameter<double>("data.max_range", config.max_range);
+    RCLCPP_INFO(this->get_logger(), "\tMax range: %.2f", config.max_range);
+    config.min_range = declare_parameter<double>("data.min_range", config.min_range);
+    RCLCPP_INFO(this->get_logger(), "\tMin range: %.2f", config.min_range);
+    config.deskew = declare_parameter<bool>("data.deskew", config.deskew);
+    RCLCPP_INFO(this->get_logger(), "\tDeskew: %d", config.deskew);
+    config.voxel_size = declare_parameter<double>("mapping.voxel_size", config.max_range / 100.0);
+    RCLCPP_INFO(this->get_logger(), "\tVoxel size: %.2f", config.voxel_size);
+    config.max_points_per_voxel =
+        declare_parameter<int>("mapping.max_points_per_voxel", config.max_points_per_voxel);
+    RCLCPP_INFO(this->get_logger(), "\tMax points per voxel: %d", config.max_points_per_voxel);
+    config.initial_threshold =
+        declare_parameter<double>("adaptive_threshold.initial_threshold", config.initial_threshold);
+    RCLCPP_INFO(this->get_logger(), "\tInitial threshold: %.2f", config.initial_threshold);
+    config.min_motion_th =
+        declare_parameter<double>("adaptive_threshold.min_motion_th", config.min_motion_th);
+    RCLCPP_INFO(this->get_logger(), "\tMin motion threshold: %.2f", config.min_motion_th);
+    config.max_num_iterations =
+        declare_parameter<int>("registration.max_num_iterations", config.max_num_iterations);
+    RCLCPP_INFO(this->get_logger(), "\tMax number of iterations: %d", config.max_num_iterations);
+    config.convergence_criterion = declare_parameter<double>("registration.convergence_criterion",
+                                                             config.convergence_criterion);
+    RCLCPP_INFO(this->get_logger(), "\tConvergence criterion: %.2f", config.convergence_criterion);
+    config.max_num_threads =
+        declare_parameter<int>("registration.max_num_threads", config.max_num_threads);
+    RCLCPP_INFO(this->get_logger(), "\tMax number of threads: %d", config.max_num_threads);
+    if (config.max_range < config.min_range) {
+        RCLCPP_WARN(get_logger(),
+                    "[WARNING] max_range is smaller than min_range, setting min_range to 0.0");
+        config.min_range = 0.0;
+    }
 }
 
 void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg) {
@@ -138,9 +166,10 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
 
     // Extract the last KISS-ICP pose, ego-centric to the LiDAR
     const Sophus::SE3d kiss_pose = kiss_icp_->pose();
+    const Eigen::Matrix<double, 6, 6> &kiss_hessian = kiss_icp_->hessian();
 
     // Spit the current estimated pose to ROS msgs handling the desired target frame
-    PublishOdometry(kiss_pose, msg->header);
+    PublishOdometry(kiss_pose, kiss_hessian, msg->header);
     // Publishing these clouds is a bit costly, so do it only if we are debugging
     if (publish_debug_clouds_) {
         PublishClouds(frame, keypoints, msg->header);
@@ -148,50 +177,85 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
 }
 
 void OdometryServer::PublishOdometry(const Sophus::SE3d &kiss_pose,
+                                     const Eigen::Matrix<double, 6, 6> &kiss_hessian,
                                      const std_msgs::msg::Header &header) {
     // If necessary, transform the ego-centric pose to the specified base_link/base_footprint frame
     const auto cloud_frame_id = header.frame_id;
     const auto egocentric_estimation = (base_frame_.empty() || base_frame_ == cloud_frame_id);
+    const auto moving_frame = egocentric_estimation ? cloud_frame_id : base_frame_;
     const auto pose = [&]() -> Sophus::SE3d {
         if (egocentric_estimation) return kiss_pose;
         const Sophus::SE3d cloud2base = LookupTransform(base_frame_, cloud_frame_id, tf2_buffer_);
         return cloud2base * kiss_pose * cloud2base.inverse();
     }();
 
+    const auto position_covariance = kiss_hessian.block<3, 3>(0, 0).inverse();
+    const auto orientation_covariance = kiss_hessian.block<3, 3>(3, 3).inverse();
+
     // Broadcast the tf ---
     if (publish_odom_tf_) {
         geometry_msgs::msg::TransformStamped transform_msg;
         transform_msg.header.stamp = header.stamp;
-        transform_msg.header.frame_id = odom_frame_;
-        transform_msg.child_frame_id = egocentric_estimation ? cloud_frame_id : base_frame_;
-        transform_msg.transform = tf2::sophusToTransform(pose);
+        if (invert_odom_tf_) {
+            transform_msg.header.frame_id = moving_frame;
+            transform_msg.child_frame_id = lidar_odom_frame_;
+            transform_msg.transform = tf2::sophusToTransform(pose.inverse());
+        } else {
+            transform_msg.header.frame_id = lidar_odom_frame_;
+            transform_msg.child_frame_id = moving_frame;
+            transform_msg.transform = tf2::sophusToTransform(pose);
+        }
         tf_broadcaster_->sendTransform(transform_msg);
     }
 
     // publish odometry msg
     nav_msgs::msg::Odometry odom_msg;
     odom_msg.header.stamp = header.stamp;
-    odom_msg.header.frame_id = odom_frame_;
+    odom_msg.header.frame_id = lidar_odom_frame_;
+    odom_msg.child_frame_id = moving_frame;
     odom_msg.pose.pose = tf2::sophusToPose(pose);
     odom_msg.pose.covariance.fill(0.0);
-    odom_msg.pose.covariance[0] = position_covariance_;
-    odom_msg.pose.covariance[7] = position_covariance_;
-    odom_msg.pose.covariance[14] = position_covariance_;
-    odom_msg.pose.covariance[21] = orientation_covariance_;
-    odom_msg.pose.covariance[28] = orientation_covariance_;
-    odom_msg.pose.covariance[35] = orientation_covariance_;
+    odom_msg.pose.covariance[0] = position_covariance(0, 0);
+    odom_msg.pose.covariance[1] = position_covariance(0, 1);
+    odom_msg.pose.covariance[2] = position_covariance(0, 2);
+    odom_msg.pose.covariance[6] = position_covariance(1, 0);
+    odom_msg.pose.covariance[7] = position_covariance(1, 1);
+    odom_msg.pose.covariance[8] = position_covariance(1, 2);
+    odom_msg.pose.covariance[12] = position_covariance(2, 0);
+    odom_msg.pose.covariance[13] = position_covariance(2, 1);
+    odom_msg.pose.covariance[14] = position_covariance(2, 2);
+    odom_msg.pose.covariance[21] = orientation_covariance(0, 0);
+    odom_msg.pose.covariance[22] = orientation_covariance(0, 1);
+    odom_msg.pose.covariance[23] = orientation_covariance(0, 2);
+    odom_msg.pose.covariance[27] = orientation_covariance(1, 0);
+    odom_msg.pose.covariance[28] = orientation_covariance(1, 1);
+    odom_msg.pose.covariance[29] = orientation_covariance(1, 2);
+    odom_msg.pose.covariance[33] = orientation_covariance(2, 0);
+    odom_msg.pose.covariance[34] = orientation_covariance(2, 1);
+    odom_msg.pose.covariance[35] = orientation_covariance(2, 2);
     odom_publisher_->publish(std::move(odom_msg));
 }
 
-void OdometryServer::PublishClouds(const std::vector<Eigen::Vector3d> frame,
-                                   const std::vector<Eigen::Vector3d> keypoints,
+void OdometryServer::PublishClouds(const std::vector<Eigen::Vector3d> &frame,
+                                   const std::vector<Eigen::Vector3d> &keypoints,
                                    const std_msgs::msg::Header &header) {
     const auto kiss_map = kiss_icp_->LocalMap();
-    const auto kiss_pose = kiss_icp_->pose().inverse();
 
     frame_publisher_->publish(std::move(EigenToPointCloud2(frame, header)));
     kpoints_publisher_->publish(std::move(EigenToPointCloud2(keypoints, header)));
-    map_publisher_->publish(std::move(EigenToPointCloud2(kiss_map, kiss_pose, header)));
+    auto local_map_header = header;
+    local_map_header.frame_id = lidar_odom_frame_;
+    map_publisher_->publish(std::move(EigenToPointCloud2(kiss_map, local_map_header)));
+}
+void OdometryServer::ResetService(
+    [[maybe_unused]] const std::shared_ptr<std_srvs::srv::Empty::Request> request,
+    [[maybe_unused]] std::shared_ptr<std_srvs::srv::Empty::Response> response) {
+    RCLCPP_INFO(this->get_logger(), "Resetting KISS-ICP map and odometry");
+
+    // Reset the KISS-ICP pipeline
+    kiss_icp_->Reset();
+
+    RCLCPP_INFO(this->get_logger(), "KISS-ICP reset completed successfully");
 }
 }  // namespace kiss_icp_ros
 

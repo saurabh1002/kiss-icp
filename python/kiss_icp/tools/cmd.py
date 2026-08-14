@@ -142,20 +142,7 @@ def kiss_icp_pipeline(
         show_default=False,
         help="[Optional] Path to the configuration file",
     ),
-    max_range: Optional[float] = typer.Option(
-        None,
-        "--max_range",
-        show_default=False,
-        help="[Optional] Overrides the max_range from the default configuration",
-    ),
-    deskew: bool = typer.Option(
-        None,
-        "--deskew",
-        show_default=False,
-        is_flag=True,
-        help="[Optional] Whether or not to deskew the scan or not",
-    ),
-    # Aditional Options ---------------------------------------------------------------------------
+    # Additional Options ---------------------------------------------------------------------------
     visualize: bool = typer.Option(
         False,
         "--visualize",
@@ -225,7 +212,6 @@ def kiss_icp_pipeline(
         print(f"[WARNING] '{dataloader}' does not support '--jump', starting from first frame")
         jump = 0
 
-    # Lazy-loading for faster CLI
     from kiss_icp.datasets import dataset_factory
     from kiss_icp.pipeline import OdometryPipeline
 
@@ -239,8 +225,6 @@ def kiss_icp_pipeline(
             meta=meta,
         ),
         config=config,
-        deskew=deskew,
-        max_range=max_range,
         visualize=visualize,
         n_scans=n_scans,
         jump=jump,

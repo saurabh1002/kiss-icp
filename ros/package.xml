@@ -25,9 +25,11 @@
 -->
 <package format="3">
   <name>kiss_icp</name>
-  <version>0.4.0</version>
+  <version>1.3.0</version>
   <description>KISS-ICP ROS 2 Wrapper</description>
   <maintainer email="ignaciovizzo@gmail.com">ivizzo</maintainer>
+  <maintainer email="frevo93@gmail.com">frevo</maintainer>
+  <maintainer email="benedikt.mersch@gmail.com">benedikt</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
@@ -40,6 +42,7 @@
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>tf2_ros</depend>
+  <depend>std_srvs</depend>
 
   <depend>eigen</depend>
   <depend>sophus</depend>

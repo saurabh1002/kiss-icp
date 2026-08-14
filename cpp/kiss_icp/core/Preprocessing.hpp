@@ -24,22 +24,22 @@
 
 #include <Eigen/Core>
 #include <sophus/se3.hpp>
-#include <utility>
 #include <vector>
 
 namespace kiss_icp {
 
-/// Crop the frame with max/min ranges
-std::vector<Eigen::Vector3d> Preprocess(const std::vector<Eigen::Vector3d> &frame,
-                                        double max_range,
-                                        double min_range);
+struct Preprocessor {
+    Preprocessor(const double max_range,
+                 const double min_range,
+                 const bool deskew,
+                 const int max_num_threads);
 
-/// This function only applies for the KITTI dataset, and should NOT be used by any other dataset,
-/// the original idea and part of the implementation is taking from CT-ICP(Although IMLS-SLAM
-/// Originally introduced the calibration factor)
-std::vector<Eigen::Vector3d> CorrectKITTIScan(const std::vector<Eigen::Vector3d> &frame);
-
-/// Voxelize point cloud keeping the original coordinates
-std::vector<Eigen::Vector3d> VoxelDownsample(const std::vector<Eigen::Vector3d> &frame,
-                                             double voxel_size);
+    std::vector<Eigen::Vector3d> Preprocess(const std::vector<Eigen::Vector3d> &frame,
+                                            const std::vector<double> &timestamps,
+                                            const Sophus::SE3d &relative_motion) const;
+    double max_range_;
+    double min_range_;
+    bool deskew_;
+    int max_num_threads_;
+};
 }  // namespace kiss_icp

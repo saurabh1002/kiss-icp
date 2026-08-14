@@ -22,64 +22,70 @@
 // SOFTWARE.
 #include "Preprocessing.hpp"
 
+#include <tbb/blocked_range.h>
+#include <tbb/global_control.h>
+#include <tbb/info.h>
 #include <tbb/parallel_for.h>
-#include <tsl/robin_map.h>
 
 #include <Eigen/Core>
-#include <algorithm>
-#include <cmath>
-#include <sophus/se3.hpp>
+#include <thread>
 #include <vector>
 
-namespace {
-using Voxel = Eigen::Vector3i;
-struct VoxelHash {
-    size_t operator()(const Voxel &voxel) const {
-        const uint32_t *vec = reinterpret_cast<const uint32_t *>(voxel.data());
-        return ((1 << 20) - 1) & (vec[0] * 73856093 ^ vec[1] * 19349669 ^ vec[2] * 83492791);
-    }
-};
-}  // namespace
+constexpr int TBB_BLOCK_SIZE = 32;
 
 namespace kiss_icp {
-std::vector<Eigen::Vector3d> VoxelDownsample(const std::vector<Eigen::Vector3d> &frame,
-                                             double voxel_size) {
-    tsl::robin_map<Voxel, Eigen::Vector3d, VoxelHash> grid;
-    grid.reserve(frame.size());
-    for (const auto &point : frame) {
-        const auto voxel = Voxel((point / voxel_size).cast<int>());
-        if (grid.contains(voxel)) continue;
-        grid.insert({voxel, point});
-    }
-    std::vector<Eigen::Vector3d> frame_dowsampled;
-    frame_dowsampled.reserve(grid.size());
-    for (const auto &[voxel, point] : grid) {
-        (void)voxel;
-        frame_dowsampled.emplace_back(point);
-    }
-    return frame_dowsampled;
+
+Preprocessor::Preprocessor(const double max_range,
+                           const double min_range,
+                           const bool deskew,
+                           const int max_num_threads)
+    : max_range_(max_range),
+      min_range_(min_range),
+      deskew_(deskew),
+      max_num_threads_(max_num_threads > 0 ? max_num_threads
+                                           : std::thread::hardware_concurrency()) {
+    // This global variable requires static duration storage to be able to manipulate the max
+    // concurrency from TBB across the entire class
+    static const auto tbb_control_settings = tbb::global_control(
+        tbb::global_control::max_allowed_parallelism, static_cast<size_t>(max_num_threads_));
 }
 
-std::vector<Eigen::Vector3d> Preprocess(const std::vector<Eigen::Vector3d> &frame,
-                                        double max_range,
-                                        double min_range) {
-    std::vector<Eigen::Vector3d> inliers;
-    std::copy_if(frame.cbegin(), frame.cend(), std::back_inserter(inliers), [&](const auto &pt) {
-        const double norm = pt.norm();
-        return norm < max_range && norm > min_range;
-    });
-    return inliers;
-}
-
-std::vector<Eigen::Vector3d> CorrectKITTIScan(const std::vector<Eigen::Vector3d> &frame) {
-    constexpr double VERTICAL_ANGLE_OFFSET = (0.205 * M_PI) / 180.0;
-    std::vector<Eigen::Vector3d> corrected_frame(frame.size());
-    tbb::parallel_for(size_t(0), frame.size(), [&](size_t i) {
-        const auto &pt = frame[i];
-        const Eigen::Vector3d rotationVector = pt.cross(Eigen::Vector3d(0., 0., 1.));
-        corrected_frame[i] =
-            Eigen::AngleAxisd(VERTICAL_ANGLE_OFFSET, rotationVector.normalized()) * pt;
-    });
-    return corrected_frame;
+std::vector<Eigen::Vector3d> Preprocessor::Preprocess(const std::vector<Eigen::Vector3d> &frame,
+                                                      const std::vector<double> &timestamps,
+                                                      const Sophus::SE3d &relative_motion) const {
+    const std::vector<Eigen::Vector3d> &deskewed_frame = [&]() {
+        if (!deskew_ || timestamps.empty()) {
+            return frame;
+        } else {
+            const auto &[min, max] = std::minmax_element(timestamps.cbegin(), timestamps.cend());
+            const double min_time = *min;
+            const double max_time = *max;
+            const double delta_time_inv = 1.0 / (max_time - min_time);
+            const auto omega = relative_motion.log();
+            std::vector<Eigen::Vector3d> deskewed_frame(frame.size());
+            tbb::parallel_for(
+                // Index Range
+                tbb::blocked_range<size_t>{0, deskewed_frame.size(), TBB_BLOCK_SIZE},
+                // Parallel Compute
+                [&](const tbb::blocked_range<size_t> &r) {
+                    for (size_t idx = r.begin(); idx < r.end(); ++idx) {
+                        const auto &point = frame[idx];
+                        const auto &stamp = (timestamps[idx] - min_time) * delta_time_inv;
+                        const auto pose = Sophus::SE3d::exp((stamp - 1.0) * omega);
+                        deskewed_frame[idx] = pose * point;
+                    };
+                });
+            return deskewed_frame;
+        }
+    }();
+    std::vector<Eigen::Vector3d> preprocessed_frame;
+    preprocessed_frame.reserve(deskewed_frame.size());
+    for (const auto &point : deskewed_frame) {
+        const double point_range = point.norm();
+        if (point_range < max_range_ && point_range > min_range_) {
+            preprocessed_frame.emplace_back(point);
+        }
+    }
+    return preprocessed_frame;
 }
 }  // namespace kiss_icp

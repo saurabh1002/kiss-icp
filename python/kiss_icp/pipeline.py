@@ -25,7 +25,7 @@ import datetime
 import os
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import numpy as np
 from pyquaternion import Quaternion
@@ -35,7 +35,7 @@ from kiss_icp.kiss_icp import KissICP
 from kiss_icp.metrics import absolute_trajectory_error, sequence_error
 from kiss_icp.tools.pipeline_results import PipelineResults
 from kiss_icp.tools.progress_bar import get_progress_bar
-from kiss_icp.tools.visualizer import RegistrationVisualizer, StubVisualizer
+from kiss_icp.tools.visualizer import Kissualizer, StubVisualizer
 
 
 class OdometryPipeline:
@@ -43,8 +43,6 @@ class OdometryPipeline:
         self,
         dataset,
         config: Optional[Path] = None,
-        deskew: Optional[bool] = False,
-        max_range: Optional[float] = None,
         visualize: bool = False,
         n_scans: int = -1,
         jump: int = 0,
@@ -58,14 +56,14 @@ class OdometryPipeline:
         self._last = self._jump + self._n_scans
 
         # Config and output dir
-        self.config = load_config(config, deskew=deskew, max_range=max_range)
+        self.config = load_config(config)
         self.results_dir = None
 
         # Pipeline
         self.odometry = KissICP(config=self.config)
         self.results = PipelineResults()
-        self.times = []
-        self.poses = []
+        self.times = np.zeros(self._n_scans)
+        self.poses = np.zeros((self._n_scans, 4, 4))
         self.has_gt = hasattr(self._dataset, "gt_poses")
         self.gt_poses = self._dataset.gt_poses[self._first : self._last] if self.has_gt else None
         self.dataset_name = self._dataset.__class__.__name__
@@ -76,9 +74,13 @@ class OdometryPipeline:
         )
 
         # Visualizer
-        self.visualizer = RegistrationVisualizer() if visualize else StubVisualizer()
+        self.visualizer = Kissualizer() if visualize else StubVisualizer()
+        self._vis_infos = {
+            "max_range": self.config.data.max_range,
+            "min_range": self.config.data.min_range,
+        }
         if hasattr(self._dataset, "use_global_visualizer"):
-            self.visualizer.global_view = self._dataset.use_global_visualizer
+            self.visualizer._global_view = self._dataset.use_global_visualizer
 
     # Public interface  ------
     def run(self):
@@ -94,40 +96,40 @@ class OdometryPipeline:
     # Private interface  ------
     def _run_pipeline(self):
         for idx in get_progress_bar(self._first, self._last):
-            raw_frame, timestamps = self._next(idx)
+            raw_frame, timestamps = self._dataset[idx]
             start_time = time.perf_counter_ns()
             source, keypoints = self.odometry.register_frame(raw_frame, timestamps)
-            self.poses.append(self.odometry.last_pose)
-            self.times.append(time.perf_counter_ns() - start_time)
-            self.visualizer.update(source, keypoints, self.odometry.local_map, self.poses[-1])
+            self.poses[idx - self._first] = self.odometry.last_pose
+            self.times[idx - self._first] = time.perf_counter_ns() - start_time
 
-    def _next(self, idx):
-        """TODO: re-arrange this logic"""
-        dataframe = self._dataset[idx]
-        try:
-            frame, timestamps = dataframe
-        except ValueError:
-            frame = dataframe
-            timestamps = np.zeros(frame.shape[0])
-        return frame, timestamps
+            # Udate visualizer
+            self._vis_infos["FPS"] = int(np.floor(self._get_fps()))
+            self.visualizer.update(
+                source,
+                keypoints,
+                self.odometry.local_map,
+                self.odometry.last_pose,
+                self._vis_infos,
+            )
 
     @staticmethod
-    def save_poses_kitti_format(filename: str, poses: List[np.ndarray]):
+    def save_poses_kitti_format(filename: str, poses: np.ndarray):
         def _to_kitti_format(poses: np.ndarray) -> np.ndarray:
-            return np.array([np.concatenate((pose[0], pose[1], pose[2])) for pose in poses])
+            return poses[:, :3].reshape(-1, 12)
 
         np.savetxt(fname=f"{filename}_kitti.txt", X=_to_kitti_format(poses))
 
     @staticmethod
     def save_poses_tum_format(filename, poses, timestamps):
         def _to_tum_format(poses, timestamps):
-            tum_data = []
+            tum_data = np.zeros((len(poses), 8))
             with contextlib.suppress(ValueError):
                 for idx in range(len(poses)):
-                    tx, ty, tz = poses[idx][:3, -1].flatten()
+                    tx, ty, tz = poses[idx, :3, -1].flatten()
                     qw, qx, qy, qz = Quaternion(matrix=poses[idx], atol=0.01).elements
-                    tum_data.append([float(timestamps[idx]), tx, ty, tz, qx, qy, qz, qw])
-            return np.array(tum_data).astype(np.float64)
+                    tum_data[idx] = np.r_[float(timestamps[idx]), tx, ty, tz, qx, qy, qz, qw]
+                tum_data.flatten()
+                return tum_data.astype(np.float64)
 
         np.savetxt(fname=f"{filename}_tum.txt", X=_to_tum_format(poses, timestamps), fmt="%.4f")
 
@@ -142,7 +144,7 @@ class OdometryPipeline:
         return (
             self._dataset.get_frames_timestamps()
             if hasattr(self._dataset, "get_frames_timestamps")
-            else np.arange(0, len(self.poses), 1.0)
+            else np.arange(0, self._n_scans, 1.0)
         )
 
     def _save_poses(self, filename: str, poses, timestamps):
@@ -166,6 +168,11 @@ class OdometryPipeline:
             timestamps=self._get_frames_timestamps(),
         )
 
+    def _get_fps(self):
+        times_nozero = self.times[self.times != 0]
+        total_time_s = np.sum(times_nozero) * 1e-9
+        return float(times_nozero.shape[0] / total_time_s) if total_time_s > 0 else 0
+
     def _run_evaluation(self):
         # Run estimation metrics evaluation, only when GT data was provided
         if self.has_gt:
@@ -177,14 +184,12 @@ class OdometryPipeline:
             self.results.append(desc="Absolute Rotational Error (ARE)", units="rad", value=ate_rot)
 
         # Run timing metrics evaluation, always
-        def _get_fps():
-            total_time_s = sum(self.times) * 1e-9
-            return float(len(self.times) / total_time_s)
-
-        avg_fps = int(np.ceil(_get_fps()))
-        avg_ms = int(np.ceil(1e3 * (1 / _get_fps())))
-        self.results.append(desc="Average Frequency", units="Hz", value=avg_fps, trunc=True)
-        self.results.append(desc="Average Runtime", units="ms", value=avg_ms, trunc=True)
+        fps = self._get_fps()
+        avg_fps = int(np.floor(fps))
+        avg_ms = int(np.ceil(1e3 / fps)) if fps > 0 else 0
+        if avg_fps > 0:
+            self.results.append(desc="Average Frequency", units="Hz", value=avg_fps, trunc=True)
+            self.results.append(desc="Average Runtime", units="ms", value=avg_ms, trunc=True)
 
     def _write_log(self):
         if not self.results.empty():

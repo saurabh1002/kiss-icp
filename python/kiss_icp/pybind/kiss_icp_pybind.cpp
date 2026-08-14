@@ -27,10 +27,11 @@
 #include <pybind11/stl_bind.h>
 
 #include <Eigen/Core>
+#include <algorithm>
+#include <cmath>
 #include <memory>
 #include <vector>
 
-#include "kiss_icp/core/Deskew.hpp"
 #include "kiss_icp/core/Preprocessing.hpp"
 #include "kiss_icp/core/Registration.hpp"
 #include "kiss_icp/core/Threshold.hpp"
@@ -51,11 +52,10 @@ PYBIND11_MODULE(kiss_icp_pybind, m) {
 
     // Map representation
     py::class_<VoxelHashMap> internal_map(m, "_VoxelHashMap", "Don't use this");
-    internal_map
-        .def(py::init<double, double, int>(), "voxel_size"_a, "max_distance"_a,
-             "max_points_per_voxel"_a)
+    internal_map.def(py::init<double, double>(), "voxel_size"_a, "max_distance"_a)
         .def("_clear", &VoxelHashMap::Clear)
         .def("_empty", &VoxelHashMap::Empty)
+        .def("_size", &VoxelHashMap::Size)
         .def("_update",
              py::overload_cast<const std::vector<Eigen::Vector3d> &, const Eigen::Vector3d &>(
                  &VoxelHashMap::Update),
@@ -64,13 +64,26 @@ PYBIND11_MODULE(kiss_icp_pybind, m) {
             "_update",
             [](VoxelHashMap &self, const std::vector<Eigen::Vector3d> &points,
                const Eigen::Matrix4d &T) {
-                Sophus::SE3d pose(T);
+                const Sophus::SE3d pose(T);
                 self.Update(points, pose);
             },
             "points"_a, "pose"_a)
         .def("_add_points", &VoxelHashMap::AddPoints, "points"_a)
         .def("_remove_far_away_points", &VoxelHashMap::RemovePointsFarFromLocation, "origin"_a)
         .def("_point_cloud", &VoxelHashMap::Pointcloud);
+
+    py::class_<Preprocessor> internal_preprocessor(m, "_Preprocessor", "Don't use this");
+    internal_preprocessor
+        .def(py::init<double, double, bool, int>(), "max_range"_a, "min_range"_a, "deskew"_a,
+             "max_num_threads"_a)
+        .def(
+            "_preprocess",
+            [](Preprocessor &self, const std::vector<Eigen::Vector3d> &points,
+               const std::vector<double> &timestamps, const Eigen::Matrix4d &relative_motion) {
+                const Sophus::SE3d motion(relative_motion);
+                return self.Preprocess(points, timestamps, motion);
+            },
+            "points"_a, "timestamps"_a, "relative_motion"_a);
 
     // Point Cloud registration
     py::class_<Registration> internal_registration(m, "_Registration", "Don't use this");
@@ -82,14 +95,23 @@ PYBIND11_MODULE(kiss_icp_pybind, m) {
             [](Registration &self, const std::vector<Eigen::Vector3d> &points,
                const VoxelHashMap &voxel_map, const Eigen::Matrix4d &T_guess,
                double max_correspondence_distance, double kernel) {
-                Sophus::SE3d initial_guess(T_guess);
-                return self
-                    .AlignPointsToMap(points, voxel_map, initial_guess, max_correspondence_distance,
-                                      kernel)
-                    .matrix();
+                const Sophus::SE3d initial_guess(T_guess);
+                auto pose = self.AlignPointsToMap(points, voxel_map, initial_guess,
+                                                  max_correspondence_distance, kernel);
+                return pose.matrix();
             },
             "points"_a, "voxel_map"_a, "initial_guess"_a, "max_correspondance_distance"_a,
-            "kernel"_a);
+            "kernel"_a)
+        .def(
+            "_get_hessian",
+            [](Registration &self, const std::vector<Eigen::Vector3d> &points,
+               const VoxelHashMap &voxel_map, const Eigen::Matrix4d &T,
+               double max_correspondence_distance) {
+                const Sophus::SE3d pose(T);
+                return self.GetHessian(points, voxel_map, pose, max_correspondence_distance);
+            },
+            "points"_a, "voxel_map"_a, "pose"_a, "max_correspondence_distance"_a)
+        .def_readonly("fitness_", &Registration::fitness_);
 
     // AdaptiveThreshold bindings
     py::class_<AdaptiveThreshold> adaptive_threshold(m, "_AdaptiveThreshold", "Don't use this");
@@ -100,25 +122,28 @@ PYBIND11_MODULE(kiss_icp_pybind, m) {
         .def(
             "_update_model_deviation",
             [](AdaptiveThreshold &self, const Eigen::Matrix4d &T) {
-                Sophus::SE3d model_deviation(T);
+                const Sophus::SE3d model_deviation(T);
                 self.UpdateModelDeviation(model_deviation);
             },
             "model_deviation"_a);
 
-    // DeSkewScan
-    m.def(
-        "_deskew_scan",
-        [](const std::vector<Eigen::Vector3d> &frame, const std::vector<double> &timestamps,
-           const Eigen::Matrix4d &T_delta) {
-            Sophus::SE3d delta(T_delta);
-            return DeSkewScan(frame, timestamps, delta);
-        },
-        "frame"_a, "timestamps"_a, "delta"_a);
-
     // prerpocessing modules
     m.def("_voxel_down_sample", &VoxelDownsample, "frame"_a, "voxel_size"_a);
-    m.def("_preprocess", &Preprocess, "frame"_a, "max_range"_a, "min_range"_a);
-    m.def("_correct_kitti_scan", &CorrectKITTIScan, "frame"_a);
+    /// This function only applies for the KITTI dataset, and should NOT be used by any other
+    /// dataset, the original idea and part of the implementation is taking from CT-ICP(Although
+    /// IMLS-SLAM Originally introduced the calibration factor)
+    m.def(
+        "_correct_kitti_scan",
+        [](const std::vector<Eigen::Vector3d> &frame) {
+            constexpr double VERTICAL_ANGLE_OFFSET = (0.205 * M_PI) / 180.0;
+            std::vector<Eigen::Vector3d> frame_ = frame;
+            std::transform(frame_.cbegin(), frame_.cend(), frame_.begin(), [&](const auto pt) {
+                const Eigen::Vector3d rotationVector = pt.cross(Eigen::Vector3d(0., 0., 1.));
+                return Eigen::AngleAxisd(VERTICAL_ANGLE_OFFSET, rotationVector.normalized()) * pt;
+            });
+            return frame_;
+        },
+        "frame"_a);
 
     // Metrics
     m.def("_kitti_seq_error", &metrics::SeqError, "gt_poses"_a, "results_poses"_a);

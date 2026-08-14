@@ -1,6 +1,7 @@
 // MIT License
 //
-// Copyright (c) 2022 Ignacio Vizzo, Tiziano Guadagnino, Benedikt Mersch, Cyrill
+// Modified work Copyright (c) 2026 Saurabh Gupta
+// Copyright (c) 2023 Ignacio Vizzo, Tiziano Guadagnino, Benedikt Mersch, Cyrill
 // Stachniss.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -23,101 +24,113 @@
 #include "Registration.hpp"
 
 #include <tbb/blocked_range.h>
+#include <tbb/enumerable_thread_specific.h>
 #include <tbb/global_control.h>
 #include <tbb/info.h>
+#include <tbb/parallel_for.h>
 #include <tbb/parallel_reduce.h>
 
-#include <algorithm>
-#include <cmath>
+#include <Eigen/Core>
+#include <Eigen/Eigenvalues>
+#include <array>
+#include <iostream>
 #include <numeric>
 #include <sophus/se3.hpp>
 #include <sophus/so3.hpp>
+#include <thread>
 #include <tuple>
+#include <vector>
 
 #include "VoxelHashMap.hpp"
+#include "VoxelUtils.hpp"
 
 namespace Eigen {
 using Matrix6d = Eigen::Matrix<double, 6, 6>;
 using Matrix3_6d = Eigen::Matrix<double, 3, 6>;
 using Vector6d = Eigen::Matrix<double, 6, 1>;
+using RowVector9d = Eigen::Matrix<double, 1, 9>;
 }  // namespace Eigen
 
 using Correspondences = std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>>;
 using LinearSystem = std::pair<Eigen::Matrix6d, Eigen::Vector6d>;
 
+constexpr int TBB_BLOCK_SIZE = 32;
+
+constexpr int num_samples = 6;
+constexpr std::array<double, num_samples> lin_perturb_val{-0.1, -0.06, -0.02, 0.02, 0.06, 0.1};
+constexpr std::array<double, num_samples> ang_perturb_val{-0.01, -0.006, -0.002,
+                                                          0.002, 0.006,  0.01};
+using LinearSystemUncertainty = Eigen::Matrix<double, 9, num_samples * 6>;
+
 namespace {
 inline double square(double x) { return x * x; }
 
+auto to_square_symettric = [](const Eigen::Vector6d &vec) {
+    Eigen::Matrix3d mat;
+    mat << vec(0), vec(3), vec(5), vec(3), vec(1), vec(4), vec(5), vec(4), vec(2);
+    return mat;
+};
+
 void TransformPoints(const Sophus::SE3d &T, std::vector<Eigen::Vector3d> &points) {
-    std::transform(points.cbegin(), points.cend(), points.begin(),
-                   [&](const auto &point) { return T * point; });
-}
-
-using Voxel = kiss_icp::VoxelHashMap::Voxel;
-std::vector<Voxel> GetAdjacentVoxels(const Voxel &voxel, int adjacent_voxels = 1) {
-    std::vector<Voxel> voxel_neighborhood;
-    for (int i = voxel.x() - adjacent_voxels; i < voxel.x() + adjacent_voxels + 1; ++i) {
-        for (int j = voxel.y() - adjacent_voxels; j < voxel.y() + adjacent_voxels + 1; ++j) {
-            for (int k = voxel.z() - adjacent_voxels; k < voxel.z() + adjacent_voxels + 1; ++k) {
-                voxel_neighborhood.emplace_back(i, j, k);
-            }
-        }
+    const Eigen::Matrix3d R = T.rotationMatrix();
+    const Eigen::Vector3d t = T.translation();
+    for (auto &point : points) {
+        point = R * point + t;
     }
-    return voxel_neighborhood;
 }
 
-std::tuple<Eigen::Vector3d, double> GetClosestNeighbor(const Eigen::Vector3d &point,
-                                                       const kiss_icp::VoxelHashMap &voxel_map) {
-    // Convert the point to voxel coordinates
-    const auto &voxel = voxel_map.PointToVoxel(point);
-    // Get nearby voxels on the map
-    const auto &query_voxels = GetAdjacentVoxels(voxel);
-    // Extract the points contained within the neighborhood voxels
-    const auto &neighbors = voxel_map.GetPoints(query_voxels);
-
-    // Find the nearest neighbor
-    Eigen::Vector3d closest_neighbor = Eigen::Vector3d::Zero();
-    double closest_distance = std::numeric_limits<double>::max();
-    std::for_each(neighbors.cbegin(), neighbors.cend(), [&](const auto &neighbor) {
-        double distance = (neighbor - point).norm();
-        if (distance < closest_distance) {
-            closest_neighbor = neighbor;
-            closest_distance = distance;
+double GetIcpResidual(const std::vector<Eigen::Vector3d> &points,
+                      const Sophus::SE3d &pose,
+                      const kiss_icp::VoxelHashMap &voxel_map,
+                      const double max_correspondance_distance) {
+    tbb::enumerable_thread_specific<double> threadwise_sum_residuals;
+    tbb::enumerable_thread_specific<size_t> threadwise_num_residuals;
+    const Eigen::Matrix3d R = pose.rotationMatrix();
+    const Eigen::Vector3d t = pose.translation();
+    tbb::parallel_for(size_t{0}, points.size(), [&](size_t i) {
+        const auto transformed_point = R * points[i] + t;
+        const auto closest_neighbor =
+            voxel_map.GetClosestNeighbor(transformed_point, max_correspondance_distance);
+        if (closest_neighbor) {
+            const double residual = (transformed_point - *closest_neighbor).norm();
+            threadwise_sum_residuals.local() += residual;
+            threadwise_num_residuals.local() += 1;
         }
     });
-    return std::make_tuple(closest_neighbor, closest_distance);
+
+    double sum_residual = 0.0;
+    size_t num_residuals = 0;
+    for (const auto &local : threadwise_sum_residuals) {
+        sum_residual += local;
+    }
+    for (const auto &local : threadwise_num_residuals) {
+        num_residuals += local;
+    }
+
+    const double mean_residual = num_residuals > 0
+                                     ? sum_residual / static_cast<double>(num_residuals)
+                                     : max_correspondance_distance;
+    return mean_residual;
 }
 
 Correspondences DataAssociation(const std::vector<Eigen::Vector3d> &points,
                                 const kiss_icp::VoxelHashMap &voxel_map,
                                 const double max_correspondance_distance) {
-    using points_iterator = std::vector<Eigen::Vector3d>::const_iterator;
+    tbb::enumerable_thread_specific<Correspondences> local_correspondences;
+    tbb::parallel_for(size_t{0}, points.size(), [&](size_t i) {
+        const auto closest_neighbor =
+            voxel_map.GetClosestNeighbor(points[i], max_correspondance_distance);
+        if (closest_neighbor) {
+            local_correspondences.local().emplace_back(points[i], *closest_neighbor);
+        }
+    });
+
     Correspondences correspondences;
     correspondences.reserve(points.size());
-    correspondences = tbb::parallel_reduce(
-        // Range
-        tbb::blocked_range<points_iterator>{points.cbegin(), points.cend()},
-        // Identity
-        correspondences,
-        // 1st lambda: Parallel computation
-        [&](const tbb::blocked_range<points_iterator> &r, Correspondences res) -> Correspondences {
-            res.reserve(r.size());
-            std::for_each(r.begin(), r.end(), [&](const auto &point) {
-                const auto &[closest_neighbor, distance] = GetClosestNeighbor(point, voxel_map);
-                if (distance < max_correspondance_distance) {
-                    res.emplace_back(point, closest_neighbor);
-                }
-            });
-            return res;
-        },
-        // 2nd lambda: Parallel reduction
-        [](Correspondences a, const Correspondences &b) -> Correspondences {
-            a.insert(a.end(),                              //
-                     std::make_move_iterator(b.cbegin()),  //
-                     std::make_move_iterator(b.cend()));
-            return a;
-        });
-
+    for (auto &local : local_correspondences) {
+        correspondences.insert(correspondences.end(), std::make_move_iterator(local.begin()),
+                               std::make_move_iterator(local.end()));
+    }
     return correspondences;
 }
 
@@ -138,14 +151,14 @@ LinearSystem BuildLinearSystem(const Correspondences &correspondences, const dou
     };
 
     auto GM_weight = [&](const double &residual2) {
-        return square(kernel_scale) / square(kernel_scale + residual2);
+        return square(kernel_scale / (kernel_scale + residual2));
     };
 
     using correspondence_iterator = Correspondences::const_iterator;
-    const auto &[JTJ, JTr] = tbb::parallel_reduce(
+    auto [JTJ, JTr] = tbb::parallel_reduce(
         // Range
         tbb::blocked_range<correspondence_iterator>{correspondences.cbegin(),
-                                                    correspondences.cend()},
+                                                    correspondences.cend(), TBB_BLOCK_SIZE},
         // Identity
         LinearSystem(Eigen::Matrix6d::Zero(), Eigen::Vector6d::Zero()),
         // 1st Lambda: Parallel computation
@@ -161,8 +174,78 @@ LinearSystem BuildLinearSystem(const Correspondences &correspondences, const dou
         // 2nd Lambda: Parallel reduction of the private Jacboians
         sum_linear_systems);
 
-    return {JTJ, JTr};
+    return {std::move(JTJ), std::move(JTr)};
 }
+
+auto get_lin_perturbations_se3 = []() {
+    const Eigen::Matrix3d I = Eigen::Matrix3d::Identity();
+    const Eigen::Vector3d ux = Eigen::Vector3d::UnitX();
+    const Eigen::Vector3d uy = Eigen::Vector3d::UnitY();
+    const Eigen::Vector3d uz = Eigen::Vector3d::UnitZ();
+    std::array<std::array<Sophus::SE3d, 6>, num_samples> samples;
+    for (int i = 0; i < num_samples; ++i) {
+        samples[i][0] = Sophus::SE3d(I, lin_perturb_val[i] * ux);
+        samples[i][1] = Sophus::SE3d(I, lin_perturb_val[i] * uy);
+        samples[i][2] = Sophus::SE3d(I, lin_perturb_val[i] * uz);
+        samples[i][3] = Sophus::SE3d(I, (1.0 / std::sqrt(2)) * lin_perturb_val[i] * (ux + uy));
+        samples[i][4] = Sophus::SE3d(I, (1.0 / std::sqrt(2)) * lin_perturb_val[i] * (uy + uz));
+        samples[i][5] = Sophus::SE3d(I, (1.0 / std::sqrt(2)) * lin_perturb_val[i] * (ux + uz));
+    }
+    return samples;
+};
+
+auto get_ang_perturbations_se3 = []() {
+    const Eigen::Vector3d zeros = Eigen::Vector3d::Zero();
+    const Eigen::Vector3d ux = Eigen::Vector3d::UnitX();
+    const Eigen::Vector3d uy = Eigen::Vector3d::UnitY();
+    const Eigen::Vector3d uz = Eigen::Vector3d::UnitZ();
+    std::array<std::array<Sophus::SE3d, 6>, num_samples> samples;
+    for (int i = 0; i < num_samples; ++i) {
+        samples[i][0] = Sophus::SE3d(Sophus::SO3d::rotX(ang_perturb_val[i]), zeros);
+        samples[i][1] = Sophus::SE3d(Sophus::SO3d::rotY(ang_perturb_val[i]), zeros);
+        samples[i][2] = Sophus::SE3d(Sophus::SO3d::rotZ(ang_perturb_val[i]), zeros);
+        samples[i][3] = Sophus::SE3d(
+            Sophus::SO3d::exp((1.0 / std::sqrt(2)) * ang_perturb_val[i] * (ux + uy)), zeros);
+        samples[i][4] = Sophus::SE3d(
+            Sophus::SO3d::exp((1.0 / std::sqrt(2)) * ang_perturb_val[i] * (uy + uz)), zeros);
+        samples[i][5] = Sophus::SE3d(
+            Sophus::SO3d::exp((1.0 / std::sqrt(2)) * ang_perturb_val[i] * (ux + uz)), zeros);
+    }
+    return samples;
+};
+
+const auto lin_perturbations_se3 = get_lin_perturbations_se3();
+const auto ang_perturbations_se3 = get_ang_perturbations_se3();
+
+LinearSystemUncertainty BuildLinearSystemUncertainty(
+    const std::array<double, num_samples> &perturbations) {
+    Eigen::Matrix<double, num_samples * 6, 9> A;
+    for (int n = 0; n < num_samples; ++n) {
+        const double x = perturbations[n];
+        const double y = perturbations[n];
+        const double z = perturbations[n];
+        const double xy = perturbations[n] / std::sqrt(2.0);
+        const double yz = perturbations[n] / std::sqrt(2.0);
+        const double xz = perturbations[n] / std::sqrt(2.0);
+
+        A.row(n * num_samples) =
+            Eigen::RowVector9d{x, 0.0, 0.0, 0.5 * x * x, 0.0, 0.0, 0.0, 0.0, 0.0};
+        A.row(n * num_samples + 1) =
+            Eigen::RowVector9d{0.0, y, 0.0, 0.0, 0.5 * y * y, 0.0, 0.0, 0.0, 0.0};
+        A.row(n * num_samples + 2) =
+            Eigen::RowVector9d{0.0, 0.0, z, 0.0, 0.0, 0.5 * z * z, 0.0, 0.0, 0.0};
+        A.row(n * num_samples + 3) =
+            Eigen::RowVector9d{xy, xy, 0.0, 0.5 * xy * xy, 0.5 * xy * xy, 0.0, xy * xy, 0.0, 0.0};
+        A.row(n * num_samples + 4) =
+            Eigen::RowVector9d{0.0, yz, yz, 0.0, 0.5 * yz * yz, 0.5 * yz * yz, 0.0, yz * yz, 0.0};
+        A.row(n * num_samples + 5) =
+            Eigen::RowVector9d{xz, 0.0, xz, 0.5 * xz * xz, 0.0, 0.5 * xz * xz, 0.0, 0.0, xz * xz};
+    }
+    return ((A.transpose() * A).inverse() * A.transpose());
+}
+
+const LinearSystemUncertainty N_lin = BuildLinearSystemUncertainty(lin_perturb_val);
+const LinearSystemUncertainty N_ang = BuildLinearSystemUncertainty(ang_perturb_val);
 }  // namespace
 
 namespace kiss_icp {
@@ -171,7 +254,8 @@ Registration::Registration(int max_num_iteration, double convergence_criterion, 
     : max_num_iterations_(max_num_iteration),
       convergence_criterion_(convergence_criterion),
       // Only manipulate the number of threads if the user specifies something greater than 0
-      max_num_threads_(max_num_threads > 0 ? max_num_threads : tbb::info::default_concurrency()) {
+      max_num_threads_(max_num_threads > 0 ? max_num_threads
+                                           : std::thread::hardware_concurrency()) {
     // This global variable requires static duration storage to be able to manipulate the max
     // concurrency from TBB across the entire class
     static const auto tbb_control_settings = tbb::global_control(
@@ -205,8 +289,66 @@ Sophus::SE3d Registration::AlignPointsToMap(const std::vector<Eigen::Vector3d> &
         // Termination criteria
         if (dx.norm() < convergence_criterion_) break;
     }
+    const auto correspondences = DataAssociation(source, voxel_map, max_distance);
+    fitness_ = static_cast<double>(correspondences.size()) / static_cast<double>(voxel_map.Size());
     // Spit the final transformation
     return T_icp * initial_guess;
 }
 
+// perturbation analysis
+Eigen::Matrix6d Registration::GetHessian(const std::vector<Eigen::Vector3d> &frame,
+                                         const VoxelHashMap &voxel_map,
+                                         const Sophus::SE3d &pose,
+                                         const double max_correspondence_distance) {
+    const std::vector<Eigen::Vector3d> frame_downsampled =
+        VoxelDownsample(frame, voxel_map.voxel_size_ * 3.0);
+    const double ref_residual =
+        GetIcpResidual(frame_downsampled, pose, voxel_map, max_correspondence_distance);
+
+    Eigen::Matrix<double, num_samples * 6, 1> residuals_lin;
+    tbb::parallel_for(0, 6 * num_samples, [&](const int idx) {
+        const int dim = idx / num_samples;
+        const int n = idx % num_samples;
+        const Sophus::SE3d new_pose = pose * lin_perturbations_se3[dim][n];
+        residuals_lin(idx) =
+            GetIcpResidual(frame_downsampled, new_pose, voxel_map, max_correspondence_distance) -
+            ref_residual;
+    });
+
+    Eigen::Matrix<double, num_samples * 6, 1> residuals_ang;
+    tbb::parallel_for(0, 6 * num_samples, [&](const int idx) {
+        const int dim = idx / num_samples;
+        const int n = idx % num_samples;
+        const Sophus::SE3d new_pose = pose * ang_perturbations_se3[dim][n];
+        residuals_ang(idx) =
+            GetIcpResidual(frame_downsampled, new_pose, voxel_map, max_correspondence_distance) -
+            ref_residual;
+    });
+
+    const Eigen::Matrix3d hessian_lin = to_square_symettric((N_lin * residuals_lin).tail<6>());
+    const Eigen::Matrix3d hessian_ang = to_square_symettric((N_ang * residuals_ang).tail<6>());
+
+    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver_lin(hessian_lin);
+    auto eigvals_lin = solver_lin.eigenvalues();
+    const auto eigvecs_lin = solver_lin.eigenvectors();
+    for (int i = 0; i < 3; ++i) {
+        if (eigvals_lin(i) < 1e-3) {
+            eigvals_lin(i) = 1e-3;
+        }
+    }
+    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver_ang(hessian_ang);
+    auto eigvals_ang = solver_ang.eigenvalues();
+    const auto eigvecs_ang = solver_ang.eigenvectors();
+    for (int i = 0; i < 3; ++i) {
+        if (eigvals_ang(i) < 1e-3) {
+            eigvals_ang(i) = 1e-3;
+        }
+    }
+
+    Eigen::Matrix6d hessian = Eigen::Matrix6d::Zero();
+    hessian.block<3, 3>(0, 0) = eigvecs_lin * eigvals_lin.asDiagonal() * eigvecs_lin.transpose();
+    hessian.block<3, 3>(3, 3) = eigvecs_ang * eigvals_ang.asDiagonal() * eigvecs_ang.transpose();
+
+    return hessian;
+}
 }  // namespace kiss_icp
