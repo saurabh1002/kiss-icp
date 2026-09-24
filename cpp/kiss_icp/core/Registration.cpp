@@ -173,7 +173,15 @@ Sophus::SE3d Registration::AlignPointsToMap(const std::vector<Eigen::Vector3d> &
     }
     const auto correspondences = DataAssociation(source, voxel_map, max_distance);
     const auto &[JTJ, JTr] = BuildLinearSystem(correspondences, kernel_scale);
-    hessian_ = JTJ;
+    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix6d> solver(JTJ);
+    auto eigvals = solver.eigenvalues();
+    const auto eigvecs = solver.eigenvectors();
+    for (int i = 0; i < 6; ++i) {
+        if (eigvals(i) < 1e-3) {
+            eigvals(i) = 1e-3;
+        }
+    }
+    hessian_ = eigvecs * eigvals.asDiagonal() * eigvecs.transpose();
     fitness_ = static_cast<double>(correspondences.size()) / static_cast<double>(voxel_map.Size());
     // Spit the final transformation
     return T_icp * initial_guess;
