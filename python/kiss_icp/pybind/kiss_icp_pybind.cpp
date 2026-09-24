@@ -102,15 +102,6 @@ PYBIND11_MODULE(kiss_icp_pybind, m) {
             },
             "points"_a, "voxel_map"_a, "initial_guess"_a, "max_correspondance_distance"_a,
             "kernel"_a)
-        .def(
-            "_get_hessian",
-            [](Registration &self, const std::vector<Eigen::Vector3d> &points,
-               const VoxelHashMap &voxel_map, const Eigen::Matrix4d &T,
-               double max_correspondence_distance) {
-                const Sophus::SE3d pose(T);
-                return self.GetHessian(points, voxel_map, pose, max_correspondence_distance);
-            },
-            "points"_a, "voxel_map"_a, "pose"_a, "max_correspondence_distance"_a)
         .def_readonly("fitness_", &Registration::fitness_);
 
     // AdaptiveThreshold bindings

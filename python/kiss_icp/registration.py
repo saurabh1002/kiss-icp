@@ -68,18 +68,3 @@ class Registration:
             kernel=kernel,
         )
         return pose
-
-    def get_hessian(
-        self,
-        points: np.ndarray,
-        voxel_map: VoxelHashMap,
-        pose: np.ndarray,
-        max_correspondance_distance: float,
-    ) -> np.ndarray:
-        hessian = self._registration._get_hessian(
-            points=kiss_icp_pybind._Vector3dVector(points),
-            voxel_map=voxel_map._internal_map,
-            pose=pose,
-            max_correspondence_distance=max_correspondance_distance,
-        )
-        return hessian
