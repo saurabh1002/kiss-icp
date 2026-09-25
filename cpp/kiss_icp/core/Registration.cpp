@@ -173,7 +173,7 @@ Sophus::SE3d Registration::AlignPointsToMap(const std::vector<Eigen::Vector3d> &
     }
     const auto correspondences = DataAssociation(source, voxel_map, max_distance);
     const auto &[JTJ, JTr] = BuildLinearSystem(correspondences, kernel_scale);
-    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix6d> solver(JTJ);
+    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix6d> solver(JTJ / correspondences.size());
     auto eigvals = solver.eigenvalues();
     const auto eigvecs = solver.eigenvectors();
     for (int i = 0; i < 6; ++i) {
